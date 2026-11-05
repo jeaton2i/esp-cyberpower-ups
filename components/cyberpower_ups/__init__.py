@@ -3,6 +3,8 @@ import esphome.config_validation as cv
 from esphome.const import CONF_ID
 from esphome.components.esp32 import add_idf_sdkconfig_option
 
+CONF_PAGE_TITLE = "page_title"
+
 # ESPHome 2026.9.0 added esp_http_server to the ESP-IDF components that are
 # excluded from the build by default. include_builtin_idf_component only exists
 # from ESPHome 2026.2.0 on, so keep the import optional.
@@ -20,12 +22,15 @@ CyberpowerUpsComponent = cyberpower_ups_ns.class_("CyberpowerUpsComponent", cg.C
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(CyberpowerUpsComponent),
+        cv.Optional(CONF_PAGE_TITLE, default="CyberPower UPS Monitor"): cv.string_strict,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
+
+    cg.add(var.set_page_title(config[CONF_PAGE_TITLE]))
 
     # USB host on ESP32-S3
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)

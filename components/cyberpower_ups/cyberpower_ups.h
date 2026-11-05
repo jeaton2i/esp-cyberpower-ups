@@ -218,6 +218,15 @@ class CyberpowerUpsComponent : public Component {
     save_password_();
   }
 
+  // Web UI page title / heading — set from YAML (defaults to "CyberPower
+  // UPS Monitor") so multiple units flashed with this firmware can show
+  // which one you're looking at.
+  const char *get_page_title() const { return page_title_; }
+  void set_page_title(const char *title) {
+    strncpy(page_title_, title, sizeof(page_title_) - 1);
+    page_title_[sizeof(page_title_) - 1] = '\0';
+  }
+
  private:
   SemaphoreHandle_t data_mutex_ = nullptr;
   SemaphoreHandle_t ctrl_sem_ = nullptr;
@@ -243,6 +252,14 @@ class CyberpowerUpsComponent : public Component {
   HidReportMap report_map_;
   bool device_open_ = false;
 
+  // Set once per connection in handle_connect_(): true when the standard
+  // HID descriptor-usage lookup can't find the real fields (confirmed on
+  // CyberPower PID 0x0601 / CP1500PFCLCDa) and poll_ups_data_() should use
+  // the fixed-report-ID quirk table instead. See poll_ups_data_() and
+  // KNOWN_RAW_REPORT_PIDS below.
+  bool use_quirk_reports_ = false;
+  uint16_t connected_pid_ = 0;
+
   // Control transfer buffer
   static constexpr size_t CTRL_BUF_SIZE = 1024;
   usb_transfer_t *ctrl_xfer_ = nullptr;
@@ -252,6 +269,7 @@ class CyberpowerUpsComponent : public Component {
   uint32_t battery_low_runtime_s_ = 300;
   uint32_t battery_low_capacity_pct_ = 35;
   char password_[64] = {};  // Web UI password (empty = no auth)
+  char page_title_[48] = "CyberPower UPS Monitor";  // Web UI title/heading
 
   // ── NVS Config ────────────────────────────────────────────
   void load_config_() {
@@ -512,6 +530,34 @@ class CyberpowerUpsComponent : public Component {
 
     // Detect which NUT-style commands this UPS accepts
     probe_capabilities_();
+
+    // ── Decide decode strategy for this specific unit ──────────
+    // Every CyberPower model ships its own HID report descriptor. Some
+    // (e.g. this component's original target, the BR1200ELCD) populate
+    // the standard HID Power Device usages (Voltage, PercentLoad, etc.)
+    // that the descriptor-walk above resolves fields against — those
+    // keep using the normal per-usage lookup path in poll_ups_data_().
+    // Others (confirmed: CP1500PFCLCDa, PID 0x0601) don't populate those
+    // usages at all — every lookup finds zero instances — and instead
+    // expose the real data at fixed report IDs. For those we fall back
+    // to a per-PID raw-report quirk table, verified directly against
+    // real hardware (see poll_ups_data_() and KNOWN_RAW_REPORT_PIDS).
+    connected_pid_ = desc->idProduct;
+    bool has_standard_voltage =
+        report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_INPUT) != nullptr;
+
+    if (has_standard_voltage) {
+      use_quirk_reports_ = false;
+    } else if (is_known_quirk_pid_(connected_pid_)) {
+      use_quirk_reports_ = true;
+      ESP_LOGW(TAG, "Standard HID usages not found for PID 0x%04X — using known raw-report quirk", connected_pid_);
+      log_ring_append_("Standard HID usages not found — using known raw-report quirk");
+    } else {
+      use_quirk_reports_ = false;
+      ESP_LOGW(TAG, "Standard HID usages not found and no known quirk for PID 0x%04X — "
+                    "sensors will likely read 0/NaN. See README 'Reporting a problem'.", connected_pid_);
+      log_ring_append_("WARNING: unknown descriptor layout, no quirk available for this PID");
+    }
 
     xSemaphoreTake(data_mutex_, portMAX_DELAY);
     strncpy(data_.model, tmp_model, sizeof(data_.model) - 1);
@@ -908,6 +954,36 @@ class CyberpowerUpsComponent : public Component {
     return (err == ESP_OK);
   }
 
+  // ── PIDs with a confirmed fixed-report-ID quirk ────────────────
+  // Add a PID here only after verifying it with tools/probe_ups.py +
+  // tools/probe_status.py (AC-toggle test) against real hardware — do
+  // not guess. If the report layout differs between PIDs, branch inside
+  // poll_ups_data_()'s quirk block on connected_pid_ instead of assuming
+  // every entry here decodes identically.
+  static bool is_known_quirk_pid_(uint16_t pid) {
+    switch (pid) {
+      case 0x0601:  // CP1500PFCLCDa, confirmed. Likely siblings sharing
+                    // this PID per NUT's device table: OR2200LCDRM2U,
+                    // OR700LCDRM1U, PR6000LCDRTXL5U, CP1350EPFCLCD —
+                    // NOT yet individually verified, re-probe before trusting.
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // ── Raw-report helpers for this firmware's fixed report IDs ────
+  // buf[0] is always the report ID (per read_hid_report_'s GET_REPORT
+  // convention); buf[1..] is the actual payload.
+  bool read_raw_report_(uint8_t report_id, uint8_t *buf, size_t buf_size) {
+    memset(buf, 0, buf_size);
+    return read_hid_report_(report_id, ReportType::FEATURE, buf, buf_size);
+  }
+
+  static uint16_t le16_(const uint8_t *p) {
+    return (uint16_t) p[0] | ((uint16_t) p[1] << 8);
+  }
+
   // ── Read a single field value from UPS ────────────────────
   bool read_field_value_(const HidField *field, int32_t &value) {
     if (!field) return false;
@@ -1101,78 +1177,169 @@ class CyberpowerUpsComponent : public Component {
     tmp = data_;
     xSemaphoreGive(data_mutex_);
 
-    int32_t val;
-    float   fval;
-
     // ── Sensor values (no mutex held — transfers can take seconds) ──
-    //
-    // Voltage (0x30) and ConfigVoltage (0x40) each occur once per
-    // collection, so both are looked up with the collection that gives
-    // them their meaning. Without it the first copy in descriptor order
-    // wins, which on a BR1200ELCD is the PowerSummary one — the battery.
-    // That is how mains voltage came to read a rock-steady 252 V: the
-    // raw 252 was a float-charged 24 V pack at 25.2 V.
+    if (use_quirk_reports_) {
+      // This firmware (confirmed: CyberPower CP1500PFCLCDa, PID 0x0601)
+      // does not populate the standard HID Power Device usages (Voltage,
+      // PercentLoad, ConfigApparentPower, etc.) that the descriptor-walk
+      // path below relies on — every one of them resolves to zero
+      // instances (see handle_connect_()'s has_standard_voltage check,
+      // which is what routes us into this branch at all). The real data
+      // lives at fixed report IDs instead, verified directly against the
+      // hardware (not guessed): probed every candidate report with a
+      // host-OS HID client (tools/probe_ups.py), cross-checked against
+      // the unit's own nameplate (120 V / 1000 W / 1500 VA) and against
+      // a live AC-unplug/replug toggle for the status bits
+      // (tools/probe_status.py).
+      uint8_t rb[8];
 
-    auto *f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_INPUT);
-    if (f && read_field_scaled_(f, fval)) tmp.utility_voltage = fval;
+      // Report 0x08: [capacity%][runtime_to_empty_sec LE16][low_runtime_limit_sec LE16]
+      if (read_raw_report_(0x08, rb, sizeof(rb))) {
+        tmp.battery_capacity = rb[1];
+        tmp.remaining_runtime_sec = le16_(rb + 2);
+      }
 
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_OUTPUT);
-    if (f && read_field_scaled_(f, fval)) {
-      tmp.output_voltage = fval;
+      // Report 0x0a: battery voltage (live), LE16 in units of 0.1 V
+      if (read_raw_report_(0x0a, rb, sizeof(rb))) {
+        tmp.battery_voltage = le16_(rb + 1) / 10.0f;
+      }
+
+      // Report 0x0b: present-status bitmap. bit0 = AC present, bit2 = on
+      // battery — confirmed solid across TWO independent physical units
+      // (CP1500PFCLCDa and CP1500AVRLCD3) via AC unplug/replug toggle on
+      // each. bit1 looked like "charging" on the first unit (0x03 on AC)
+      // but the second unit used bit4 instead (0x11 on AC) — that bit
+      // position is NOT reliable across units sharing this PID, so we
+      // don't read a "charging" bit at all. See `charging` derivation
+      // below instead.
+      if (read_raw_report_(0x0b, rb, sizeof(rb))) {
+        uint8_t status = rb[1];
+        tmp.ac_present = (status & 0x01) != 0;
+        tmp.on_battery = (status & 0x04) != 0;
+      }
+
+      // "Charging" heuristic, not a confirmed bit (see above): on AC and
+      // battery not reported full. battery_capacity was already read from
+      // report 0x08 above, so it's available here.
+      tmp.charging = tmp.ac_present && !tmp.on_battery && tmp.battery_capacity < 100.0f;
+
+      // Report 0x0e: nominal input (mains) voltage, raw volts, 1 byte
+      if (read_raw_report_(0x0e, rb, sizeof(rb))) {
+        tmp.rating_voltage = rb[1];
+      }
+
+      // Report 0x0f: live input voltage, LE16 raw volts
+      if (read_raw_report_(0x0f, rb, sizeof(rb))) {
+        tmp.utility_voltage = le16_(rb + 1);
+      }
+
+      // Report 0x12: live output voltage, LE16 raw volts
+      if (read_raw_report_(0x12, rb, sizeof(rb))) {
+        tmp.output_voltage = le16_(rb + 1);
+      } else {
+        // No reading: on a line-interactive UPS running on mains the
+        // output tracks the input closely enough to stand in for it.
+        tmp.output_voltage = tmp.utility_voltage;
+      }
+
+      // Report 0x13: load percent, 1 byte
+      if (read_raw_report_(0x13, rb, sizeof(rb))) {
+        tmp.load_percent = rb[1];
+      }
+
+      // Report 0x17: overload flag, 1 byte
+      if (read_raw_report_(0x17, rb, sizeof(rb))) {
+        tmp.overload = (rb[1] != 0);
+      }
+
+      // Report 0x18: nameplate rating, LE16 watts + LE16 VA
+      if (read_raw_report_(0x18, rb, sizeof(rb))) {
+        tmp.rating_power_w = le16_(rb + 1);
+        tmp.rating_power_va = le16_(rb + 3);
+      }
+
+      // battery_low_flag / replace_battery / shutdown_imminent are not
+      // (yet) mapped to a confirmed raw report on this firmware. Leaving
+      // them unset is fine: update_power_state_on_() below already
+      // derives BATTERY_LOW from remaining_runtime_sec/battery_capacity
+      // vs. the configured thresholds, which now get real data above.
+
     } else {
-      // No Output collection: on a line-interactive UPS running on mains
-      // the output tracks the input closely enough to stand in for it.
-      tmp.output_voltage = tmp.utility_voltage;
+      // ── Original descriptor-usage lookup path ──
+      // Used for models that actually populate the standard HID Power
+      // Device usages (this component's original target, the
+      // BR1200ELCD, and presumably others).
+      //
+      // Voltage (0x30) and ConfigVoltage (0x40) each occur once per
+      // collection, so both are looked up with the collection that gives
+      // them their meaning. Without it the first copy in descriptor order
+      // wins, which on a BR1200ELCD is the PowerSummary one — the battery.
+      // That is how mains voltage came to read a rock-steady 252 V: the
+      // raw 252 was a float-charged 24 V pack at 25.2 V.
+      int32_t val;
+      float   fval;
+
+      auto *f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_INPUT);
+      if (f && read_field_scaled_(f, fval)) tmp.utility_voltage = fval;
+
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_OUTPUT);
+      if (f && read_field_scaled_(f, fval)) {
+        tmp.output_voltage = fval;
+      } else {
+        // No Output collection: on a line-interactive UPS running on mains
+        // the output tracks the input closely enough to stand in for it.
+        tmp.output_voltage = tmp.utility_voltage;
+      }
+
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_POWER_SUMMARY);
+      if (f && read_field_scaled_(f, fval)) tmp.battery_voltage = fval;
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_REMAINING_CAPACITY);
+      if (f && read_field_scaled_(f, fval)) tmp.battery_capacity = fval;
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_RUNTIME_TO_EMPTY);
+      if (f && read_field_scaled_(f, fval)) tmp.remaining_runtime_sec = fval;
+
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_PERCENT_LOAD);
+      if (f && read_field_scaled_(f, fval)) tmp.load_percent = fval;
+
+      // Nominal mains voltage lives in the Input collection; the
+      // PowerSummary copy is the nominal *battery* voltage (24 V here).
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_VOLTAGE, PD_COLL_INPUT);
+      if (f && read_field_scaled_(f, fval)) tmp.rating_voltage = fval;
+
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_APPARENT_POWER);
+      if (f && read_field_scaled_(f, fval)) tmp.rating_power_va = fval;
+      // rating_power_va may also come from model name (set during connect)
+
+      // Nameplate active power. Reporting it removes the need to guess a
+      // power factor when converting percent load into watts.
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_ACTIVE_POWER);
+      if (f && read_field_scaled_(f, fval)) tmp.rating_power_w = fval;
+
+      // ── Binary status ──
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_AC_PRESENT);
+      if (f && read_field_value_(f, val)) tmp.ac_present = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_DISCHARGING);
+      if (f && read_field_value_(f, val)) tmp.on_battery = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_CHARGING);
+      if (f && read_field_value_(f, val)) tmp.charging = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_OVERLOAD);
+      if (f && read_field_value_(f, val)) tmp.overload = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_BELOW_REMAINING_CAP);
+      if (f && read_field_value_(f, val)) tmp.battery_low_flag = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_NEED_REPLACEMENT);
+      if (f && read_field_value_(f, val)) tmp.replace_battery = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_SHUTDOWN_IMMINENT);
+      if (f && read_field_value_(f, val)) tmp.shutdown_imminent = (val != 0);
     }
-
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_POWER_SUMMARY);
-    if (f && read_field_scaled_(f, fval)) tmp.battery_voltage = fval;
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_REMAINING_CAPACITY);
-    if (f && read_field_scaled_(f, fval)) tmp.battery_capacity = fval;
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_RUNTIME_TO_EMPTY);
-    if (f && read_field_scaled_(f, fval)) tmp.remaining_runtime_sec = fval;
-
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_PERCENT_LOAD);
-    if (f && read_field_scaled_(f, fval)) tmp.load_percent = fval;
-
-    // Nominal mains voltage lives in the Input collection; the
-    // PowerSummary copy is the nominal *battery* voltage (24 V here).
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_VOLTAGE, PD_COLL_INPUT);
-    if (f && read_field_scaled_(f, fval)) tmp.rating_voltage = fval;
-
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_APPARENT_POWER);
-    if (f && read_field_scaled_(f, fval)) tmp.rating_power_va = fval;
-    // rating_power_va may also come from model name (set during connect)
-
-    // Nameplate active power. Reporting it removes the need to guess a
-    // power factor when converting percent load into watts.
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_ACTIVE_POWER);
-    if (f && read_field_scaled_(f, fval)) tmp.rating_power_w = fval;
-
-    // ── Binary status ──
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_AC_PRESENT);
-    if (f && read_field_value_(f, val)) tmp.ac_present = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_DISCHARGING);
-    if (f && read_field_value_(f, val)) tmp.on_battery = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_CHARGING);
-    if (f && read_field_value_(f, val)) tmp.charging = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_OVERLOAD);
-    if (f && read_field_value_(f, val)) tmp.overload = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_BELOW_REMAINING_CAP);
-    if (f && read_field_value_(f, val)) tmp.battery_low_flag = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_NEED_REPLACEMENT);
-    if (f && read_field_value_(f, val)) tmp.replace_battery = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_SHUTDOWN_IMMINENT);
-    if (f && read_field_value_(f, val)) tmp.shutdown_imminent = (val != 0);
 
     // ── State Machine (operates on local snapshot) ──
     update_power_state_on_(tmp);

@@ -102,11 +102,13 @@ static esp_err_t root_handler_(httpd_req_t *req) {
 
   auto data = web_component_->get_data();
 
+  const char *page_title = web_component_->get_page_title();
+
   char buf[4096];
   int len = snprintf(buf, sizeof(buf),
     "<!DOCTYPE html><html><head>"
     "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>CyberPower UPS Monitor</title>"
+    "<title>%s</title>"
     "<style>"
     "body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:16px;background:#1a1a2e;color:#e0e0e0}"
     "h1{color:#64ffda;font-size:1.4em;margin:0 0 16px}"
@@ -123,7 +125,7 @@ static esp_err_t root_handler_(httpd_req_t *req) {
     "button:hover{background:#00e5ff}"
     ".bool-on{color:#69f0ae}.bool-off{color:#666}"
     "</style></head><body>"
-    "<h1>&#9889; CyberPower UPS Monitor</h1>"
+    "<h1>&#9889; %s</h1>"
 
     // Connection status
     "<div class='card'><h2>Connection</h2>"
@@ -134,6 +136,8 @@ static esp_err_t root_handler_(httpd_req_t *req) {
     "<div class='item'><span class='label'>Serial</span>"
     "<span class='value'>%s</span></div>"
     "</div>",
+    page_title,
+    page_title,
     data.connected ? "ok" : "err",
     data.connected ? "Connected" : "Disconnected",
     data.model[0] ? data.model : "-",
